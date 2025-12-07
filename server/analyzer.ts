@@ -8,9 +8,13 @@ import AdmZip from "adm-zip";
 
 const execAsync = promisify(exec);
 
-// Using Gemini API (blueprint:javascript_gemini)
-// Note: the newest Gemini model series is "gemini-2.5-flash" or "gemini-2.5-pro"
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" });
+// Explicitly use GEMINI_API_KEY only
+const apiKey = process.env.GEMINI_API_KEY || "";
+const ai = apiKey ? new GoogleGenAI({ apiKey }) : null;
+
+if (!apiKey) {
+  console.warn("GEMINI_API_KEY not set - will use fallback analysis tools only");
+}
 
 interface Issue {
   severity: "critical" | "major" | "minor";
@@ -102,11 +106,130 @@ async function findFiles(dir: string, extensions: string[]): Promise<string[]> {
   return files;
 }
 
+// Retry helper with exponential backoff
+async function retryWithBackoff<T>(
+  fn: () => Promise<T>,
+  maxRetries: number = 3,
+  baseDelay: number = 1000
+): Promise<T> {
+  let lastError: any;
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      return await fn();
+    } catch (error: any) {
+      lastError = error;
+      if (error.status === 429 && i < maxRetries - 1) {
+        const delay = baseDelay * Math.pow(2, i);
+        console.log(`Rate limited, retrying in ${delay}ms...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      } else {
+        throw error;
+      }
+    }
+  }
+  throw lastError;
+}
+
+// Fallback: Analyze Python files with pylint
+async function analyzePythonWithPylint(files: string[], baseDir: string): Promise<Issue[]> {
+  const issues: Issue[] = [];
+  
+  for (const file of files) {
+    const relativePath = path.relative(baseDir, file);
+    try {
+      const { stdout, stderr } = await execAsync(
+        `pylint --output-format=json --disable=C0114,C0115,C0116 "${file}" 2>/dev/null || true`,
+        { timeout: 30000, maxBuffer: 5 * 1024 * 1024 }
+      );
+      
+      if (stdout.trim()) {
+        try {
+          const pylintIssues = JSON.parse(stdout);
+          for (const issue of pylintIssues) {
+            let severity: "critical" | "major" | "minor" = "minor";
+            if (issue.type === "error" || issue.type === "fatal") {
+              severity = "critical";
+            } else if (issue.type === "warning") {
+              severity = "major";
+            }
+            
+            issues.push({
+              severity,
+              file: relativePath,
+              line: issue.line || 1,
+              message: issue.message || "Unknown issue",
+              rule: `python/pylint-${issue.symbol || issue["message-id"] || "unknown"}`,
+              suggestion: `Fix the ${issue.type} issue`
+            });
+          }
+        } catch (parseError) {
+          console.error(`Error parsing pylint output for ${file}:`, parseError);
+        }
+      }
+    } catch (error) {
+      console.error(`Error running pylint on ${file}:`, error);
+    }
+  }
+  
+  return issues;
+}
+
+// Fallback: Analyze Python files with pyflakes
+async function analyzePythonWithPyflakes(files: string[], baseDir: string): Promise<Issue[]> {
+  const issues: Issue[] = [];
+  
+  for (const file of files) {
+    const relativePath = path.relative(baseDir, file);
+    try {
+      const { stdout, stderr } = await execAsync(
+        `pyflakes "${file}" 2>&1 || true`,
+        { timeout: 30000, maxBuffer: 5 * 1024 * 1024 }
+      );
+      
+      const output = stdout + stderr;
+      const lines = output.split('\n').filter(l => l.trim());
+      
+      for (const line of lines) {
+        const match = line.match(/:(\d+):?\s*(.+)/);
+        if (match) {
+          const lineNum = parseInt(match[1], 10) || 1;
+          const message = match[2].trim();
+          
+          let severity: "critical" | "major" | "minor" = "minor";
+          if (message.includes("undefined") || message.includes("syntax")) {
+            severity = "critical";
+          } else if (message.includes("imported but unused") || message.includes("redefinition")) {
+            severity = "major";
+          }
+          
+          issues.push({
+            severity,
+            file: relativePath,
+            line: lineNum,
+            message,
+            rule: "python/pyflakes",
+            suggestion: "Review and fix the issue"
+          });
+        }
+      }
+    } catch (error) {
+      console.error(`Error running pyflakes on ${file}:`, error);
+    }
+  }
+  
+  return issues;
+}
+
 async function analyzeFileWithGemini(
   fileContent: string,
   relativePath: string,
   language: string
 ): Promise<Issue[]> {
+  if (!ai) {
+    console.log(`Gemini not available, skipping AI analysis for ${relativePath}`);
+    return [];
+  }
+
   const systemPrompt = `You are an expert code analyzer. Analyze the given ${language} code and identify issues.
 
 For each issue found, provide a JSON array with objects containing:
@@ -133,18 +256,20 @@ Return a JSON array of issues found.`;
   try {
     console.log(`Analyzing file with Gemini: ${relativePath}`);
     
-    const response = await ai.models.generateContent({
-      model: "gemini-2.0-flash",
-      contents: [
-        {
-          role: "user",
-          parts: [{ text: systemPrompt + "\n\n" + userPrompt }]
-        }
-      ],
-      config: {
-        responseMimeType: "application/json",
-      },
-    });
+    const response = await retryWithBackoff(async () => {
+      return await ai.models.generateContent({
+        model: "gemini-2.0-flash",
+        contents: [
+          {
+            role: "user",
+            parts: [{ text: systemPrompt + "\n\n" + userPrompt }]
+          }
+        ],
+        config: {
+          responseMimeType: "application/json",
+        },
+      });
+    }, 3, 2000);
 
     console.log(`Gemini raw response for ${relativePath}:`, JSON.stringify(response).substring(0, 300));
     
@@ -183,8 +308,8 @@ Return a JSON array of issues found.`;
       console.error(`Error parsing Gemini response for ${relativePath}:`, parseError);
       console.error(`Raw response was:`, cleanedResponse.substring(0, 500));
     }
-  } catch (error) {
-    console.error(`Error analyzing file ${relativePath} with Gemini:`, error);
+  } catch (error: any) {
+    console.error(`Error analyzing file ${relativePath} with Gemini:`, error.message || error);
   }
   
   return [];
@@ -212,8 +337,43 @@ async function analyzeFilesWithGemini(
   return allIssues;
 }
 
+// Analyze Python files - try Gemini first, fallback to pylint/pyflakes
 async function analyzePythonFiles(files: string[], baseDir: string): Promise<Issue[]> {
-  return analyzeFilesWithGemini(files, baseDir, "python");
+  let issues: Issue[] = [];
+  let geminiWorked = false;
+  
+  // Try Gemini first
+  if (ai) {
+    try {
+      issues = await analyzeFilesWithGemini(files, baseDir, "python");
+      if (issues.length > 0) {
+        geminiWorked = true;
+        console.log(`Gemini found ${issues.length} Python issues`);
+      }
+    } catch (error) {
+      console.log("Gemini analysis failed, falling back to local tools");
+    }
+  }
+  
+  // If Gemini didn't work or found no issues, use pylint + pyflakes
+  if (!geminiWorked) {
+    console.log("Using pylint and pyflakes for Python analysis");
+    const pylintIssues = await analyzePythonWithPylint(files, baseDir);
+    const pyflakesIssues = await analyzePythonWithPyflakes(files, baseDir);
+    
+    // Combine and deduplicate
+    const seenKeys = new Set<string>();
+    for (const issue of [...pylintIssues, ...pyflakesIssues]) {
+      const key = `${issue.file}:${issue.line}:${issue.message}`;
+      if (!seenKeys.has(key)) {
+        seenKeys.add(key);
+        issues.push(issue);
+      }
+    }
+    console.log(`Local tools found ${issues.length} Python issues`);
+  }
+  
+  return issues;
 }
 
 async function analyzeJavaScriptFiles(files: string[], baseDir: string): Promise<Issue[]> {
@@ -230,6 +390,11 @@ async function refactorFileWithGemini(
   issues: Issue[], 
   relativePath: string
 ): Promise<string> {
+  if (!ai) {
+    console.log(`Gemini not available, skipping refactoring for ${relativePath}`);
+    return fileContent;
+  }
+
   const fileIssues = issues.filter(i => i.file === relativePath);
   
   const issuesSummary = fileIssues.length > 0 
@@ -261,15 +426,17 @@ Please provide the refactored version of this code.`;
   try {
     console.log(`Refactoring file with Gemini: ${relativePath}`);
     
-    const response = await ai.models.generateContent({
-      model: "gemini-2.0-flash",
-      contents: [
-        {
-          role: "user",
-          parts: [{ text: systemPrompt + "\n\n" + userPrompt }]
-        }
-      ],
-    });
+    const response = await retryWithBackoff(async () => {
+      return await ai.models.generateContent({
+        model: "gemini-2.0-flash",
+        contents: [
+          {
+            role: "user",
+            parts: [{ text: systemPrompt + "\n\n" + userPrompt }]
+          }
+        ],
+      });
+    }, 3, 2000);
 
     let refactoredCode = "";
     if (response.text) {
@@ -284,8 +451,8 @@ Please provide the refactored version of this code.`;
     refactoredCode = refactoredCode.replace(/^```[\w]*\n?/g, '').replace(/\n?```$/g, '').trim();
     console.log(`Gemini refactored ${relativePath}, output length: ${refactoredCode.length}`);
     return refactoredCode;
-  } catch (error) {
-    console.error(`Error refactoring file ${relativePath}:`, error);
+  } catch (error: any) {
+    console.error(`Error refactoring file ${relativePath}:`, error.message || error);
     return fileContent;
   }
 }
