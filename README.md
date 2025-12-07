@@ -75,12 +75,6 @@ npm run build
 npm start
 ```
 
-## Replit Deployment
-
-1. Clone or fork this project on Replit
-2. Set environment variables in Replit Secrets:
-   - `GEMINI_API_KEY` - Your Google Gemini API key
-   - Optionally: `N8N_WEBHOOK`, `CALLBACK_SECRET`, `EXTERNAL_BASE`
 
 ### 2. Configure n8n Workflow
 
@@ -222,6 +216,3 @@ If `N8N_WEBHOOK` is not configured, the app runs in demo mode:
 └── README.md               # This file
 ```
 
-## License
-
-MIT
